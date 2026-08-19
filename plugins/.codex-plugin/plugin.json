@@ -5,8 +5,8 @@
   "author": {
     "name": "Semantica Contributors"
   },
-  "homepage": "https://github.com/Hawksight-AI/semantica",
-  "repository": "https://github.com/Hawksight-AI/semantica",
+  "homepage": "https://github.com/TerminallyLazy/semantica",
+  "repository": "https://github.com/TerminallyLazy/semantica",
   "license": "MIT",
   "keywords": [
     "semantica",
@@ -27,6 +27,14 @@
   ],
   "skills": "./skills",
   "interface": {
+    "capabilities": [
+      "Read",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "record a causally-linked decision chain, attach provenance to every entity, and export a regulator-ready audit trail"
+    ],
+    "longDescription": "The Accountability and Context Layer for AI: Context Graphs · Decision Intelligence · Full Provenance",
     "displayName": "Semantica Codex Plugin",
     "shortDescription": "Knowledge graph skills for Semantica workflows",
     "category": "Productivity",
