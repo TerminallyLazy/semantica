@@ -6,10 +6,9 @@
   "plugins": [
     {
       "name": "semantica-codex",
-      "description": "Semantica plugin for Codex: knowledge graph commands and analytics.",
       "source": {
         "source": "local",
-        "path": "./"
+        "path": "./plugins/.codex-plugin"
       },
       "policy": {
         "installation": "AVAILABLE",
