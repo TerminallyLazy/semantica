@@ -8,7 +8,7 @@
       "name": "semantica-codex",
       "source": {
         "source": "local",
-        "path": "./plugins/.codex-plugin"
+        "path": "./"
       },
       "policy": {
         "installation": "AVAILABLE",
