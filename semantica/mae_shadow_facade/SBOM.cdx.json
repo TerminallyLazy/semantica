@@ -1,0 +1,24 @@
+{
+  "bomFormat": "CycloneDX",
+  "components": [],
+  "metadata": {
+    "component": {
+      "name": "mae-semantica-shadow-facade",
+      "properties": [
+        {"name": "mae:default-enabled", "value": "false"},
+        {"name": "mae:mutation-commit", "value": "async-deadline-fenced"},
+        {"name": "mae:production-auth", "value": "injected-asymmetric-kms-or-mtls"},
+        {"name": "mae:production-limiter", "value": "injected-distributed-account-attempts"},
+        {"name": "mae:real-data-approved", "value": "false"},
+        {"name": "mae:runtime-dependencies", "value": "python-standard-library-only"}
+      ],
+      "licenses": [{"license": {"id": "MIT"}}],
+      "type": "application",
+      "version": "1"
+    },
+    "timestamp": "2026-08-23T00:00:00Z"
+  },
+  "serialNumber": "urn:uuid:d6de8e36-739a-5f8a-b95c-63b594913af5",
+  "specVersion": "1.5",
+  "version": 1
+}

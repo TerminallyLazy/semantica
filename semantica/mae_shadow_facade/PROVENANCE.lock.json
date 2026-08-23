@@ -1,0 +1,20 @@
+{
+  "artifact": "mae-semantica-shadow-facade",
+  "baseRepository": "https://github.com/semantica-agi/semantica",
+  "baseRevision": "8b9749eb2e3035eb9f504ec561f760d17db4309e",
+  "build": {
+    "authentication": "injected-production-ready-asymmetric-kms-or-mtls",
+    "limiter": "injected-production-ready-distributed-account-attempts",
+    "mutationCommit": "async-transactional-deadline-fence-required",
+    "networkRequired": false,
+    "runtimeDependencies": [],
+    "sourceManifest": "MANIFEST.sha256",
+    "targetPython": ">=3.11"
+  },
+  "deployment": {
+    "defaultEnabled": false,
+    "realDataApproved": false,
+    "syntheticReferenceOnly": true
+  },
+  "schemaVersion": 1
+}
