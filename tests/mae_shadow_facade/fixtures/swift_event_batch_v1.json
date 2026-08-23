@@ -1,0 +1,47 @@
+{
+  "schemaVersion": 1,
+  "authorization": {
+    "scope": {
+      "accountRef": "hmac-sha256.test-v1.mvIRMpsvyC5e_pBgYscwCCgZsj_oOUvENeCxvwRY61Q",
+      "familyRef": "hmac-sha256.test-v1.00pWmreqpU2s1xWuZJU0VdhrdohGzQCF706edHFIm3s",
+      "memberRef": "hmac-sha256.test-v1.4xq2Q8RPeg7IJLWdEZTWDawzQgDYReYdLSidqg8IfqQ"
+    },
+    "authorizationGeneration": 7,
+    "sessionBindingRef": "hmac-sha256.test-v1.Pzrx7Ou9FBCrQX7A0nu_y100Dhd64Vm1n8hibC39kXU",
+    "issuedAt": "2026-08-23T12:00:00Z",
+    "expiresAt": "2026-08-23T12:01:00Z"
+  },
+  "events": [
+    {
+      "schemaVersion": 1,
+      "eventRef": "hmac-sha256.test-v1.uOH4C9cK4HhMeFWkUXMbdF_dtndJ0j9je-kIK3XpV1s",
+      "idempotencyRef": "hmac-sha256.test-v1.9dOaB-h_Y9oom0w_-NWt_G0eSTrTgbK7JCYNwDLx3gY",
+      "memoryRef": "hmac-sha256.test-v1.wGT7yp2d6N2bsGJJhEA7KNDagHppNl1Pf7CRI-ywxAU",
+      "scope": {
+        "accountRef": "hmac-sha256.test-v1.mvIRMpsvyC5e_pBgYscwCCgZsj_oOUvENeCxvwRY61Q",
+        "familyRef": "hmac-sha256.test-v1.00pWmreqpU2s1xWuZJU0VdhrdohGzQCF706edHFIm3s",
+        "memberRef": "hmac-sha256.test-v1.4xq2Q8RPeg7IJLWdEZTWDawzQgDYReYdLSidqg8IfqQ"
+      },
+      "facet": "longitudinal",
+      "authority": "connected_clinical_record",
+      "sensitivity": "restricted_clinical",
+      "retention": "source_bound",
+      "lifecycle": "active",
+      "freshness": "current",
+      "occurredAt": "2026-08-23T12:00:00Z",
+      "integrityRef": "hmac-sha256.test-v1.eFh8Qe2ZozdQItwovogvcrGmCKDax6qQDGH0iyuze-Y",
+      "lineageRefs": [],
+      "links": [
+        {
+          "kind": "evidence",
+          "targetRef": "hmac-sha256.test-v1.NKBABbyvIG7smQvZY32f22cl4KDA1K6_AD8X9MlW61w",
+          "targetScope": {
+            "accountRef": "hmac-sha256.test-v1.mvIRMpsvyC5e_pBgYscwCCgZsj_oOUvENeCxvwRY61Q",
+            "familyRef": "hmac-sha256.test-v1.00pWmreqpU2s1xWuZJU0VdhrdohGzQCF706edHFIm3s",
+            "memberRef": "hmac-sha256.test-v1.4xq2Q8RPeg7IJLWdEZTWDawzQgDYReYdLSidqg8IfqQ"
+          }
+        }
+      ]
+    }
+  ]
+}
