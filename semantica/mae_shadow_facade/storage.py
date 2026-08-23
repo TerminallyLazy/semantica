@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import threading
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Protocol
@@ -27,25 +29,63 @@ class StoreUnavailable(RuntimeError):
     pass
 
 
+class OperationDeadlineExceeded(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class OperationFence:
+    """Request fence that a production transaction must check before commit."""
+
+    request_ref: str
+    deadline_monotonic: float
+
+    def remaining(self) -> float:
+        return max(0.0, self.deadline_monotonic - time.monotonic())
+
+    def ensure_active(self) -> None:
+        if time.monotonic() >= self.deadline_monotonic:
+            raise OperationDeadlineExceeded("operation deadline exceeded")
+
+
 class TenantPartitionedShadowStore(Protocol):
-    """Production seam; every operation receives an exact pseudonymous partition."""
+    """Production seam; every operation receives an exact pseudonymous partition.
+
+    A production mutation must carry the fence into its database transaction,
+    validate it immediately before the durable commit, and roll back rather
+    than commit when the fence is expired or the coroutine is cancelled.
+    """
+
+    production_ready: bool
 
     def ready(self) -> bool: ...
 
-    def apply_events(
-        self, scope: ScopeReferences, events: tuple[EventProjection, ...]
+    async def apply_events(
+        self,
+        scope: ScopeReferences,
+        events: tuple[EventProjection, ...],
+        fence: OperationFence,
     ) -> list[dict[str, Any]]: ...
 
-    def retrieve(self, request: RetrievalRequest) -> dict[str, Any]: ...
+    async def retrieve(
+        self, request: RetrievalRequest, fence: OperationFence
+    ) -> dict[str, Any]: ...
 
-    def record_decision(self, decision: DecisionRecord) -> str: ...
+    async def record_decision(
+        self, decision: DecisionRecord, fence: OperationFence
+    ) -> str: ...
 
-    def provenance(self, scope: ScopeReferences, memory_ref: str) -> dict[str, Any]: ...
+    async def provenance(
+        self, scope: ScopeReferences, memory_ref: str, fence: OperationFence
+    ) -> dict[str, Any]: ...
 
-    def revoke(self, revocation: RevocationRecord) -> str: ...
+    async def revoke(self, revocation: RevocationRecord, fence: OperationFence) -> str: ...
 
-    def revocation_status(
-        self, scope: ScopeReferences, revocation_ref: str
+    async def revocation_status(
+        self,
+        scope: ScopeReferences,
+        revocation_ref: str,
+        fence: OperationFence,
     ) -> RevocationRecord | None: ...
 
 
@@ -83,9 +123,18 @@ class _TenantState:
 class InMemoryTenantPartitionedShadowStore:
     """Bounded synthetic/local reference store; never suitable for real ePHI."""
 
-    def __init__(self, *, available: bool = True, max_graph_visits: int = 200) -> None:
+    production_ready = False
+
+    def __init__(
+        self,
+        *,
+        available: bool = True,
+        max_graph_visits: int = 200,
+        mutation_delay_seconds: float = 0.0,
+    ) -> None:
         self._available = available
         self._max_graph_visits = max_graph_visits
+        self._mutation_delay_seconds = mutation_delay_seconds
         self._states: dict[tuple[str, str, str | None], _TenantState] = {}
         self._lock = threading.RLock()
 
@@ -95,17 +144,24 @@ class InMemoryTenantPartitionedShadowStore:
     def set_available(self, available: bool) -> None:
         self._available = available
 
-    def apply_events(
-        self, scope: ScopeReferences, events: tuple[EventProjection, ...]
+    async def apply_events(
+        self,
+        scope: ScopeReferences,
+        events: tuple[EventProjection, ...],
+        fence: OperationFence,
     ) -> list[dict[str, Any]]:
+        if self._mutation_delay_seconds:
+            await asyncio.sleep(self._mutation_delay_seconds)
+        prepared = [(event, _payload_digest(event.canonical_payload)) for event in events]
         with self._lock:
-            state = self._state(scope)
-            prepared = [(event, _payload_digest(event.canonical_payload)) for event in events]
+            fence.ensure_active()
+            state = self._state(scope, create=True)
             for event, digest in prepared:
                 existing = state.event_idempotency.get(event.idempotency_ref)
                 if existing is not None and existing[:2] != (event.event_ref, digest):
                     raise IdempotencyConflict("event idempotency conflict")
 
+            fence.ensure_active()
             results: list[dict[str, Any]] = []
             for event, digest in prepared:
                 existing = state.event_idempotency.get(event.idempotency_ref)
@@ -148,9 +204,12 @@ class InMemoryTenantPartitionedShadowStore:
                 )
             return results
 
-    def retrieve(self, request: RetrievalRequest) -> dict[str, Any]:
+    async def retrieve(
+        self, request: RetrievalRequest, fence: OperationFence
+    ) -> dict[str, Any]:
         with self._lock:
-            state = self._state(request.authorization.scope)
+            fence.ensure_active()
+            state = self._state(request.authorization.scope, create=False)
             eligible = []
             omitted: set[str] = set()
             for mapping in request.candidate_mappings:
@@ -216,21 +275,33 @@ class InMemoryTenantPartitionedShadowStore:
                 "omissionCodes": sorted(omitted),
             }
 
-    def record_decision(self, decision: DecisionRecord) -> str:
+    async def record_decision(
+        self, decision: DecisionRecord, fence: OperationFence
+    ) -> str:
+        if self._mutation_delay_seconds:
+            await asyncio.sleep(self._mutation_delay_seconds)
         with self._lock:
-            state = self._state(decision.authorization.scope)
+            fence.ensure_active()
+            state = self._state(decision.authorization.scope, create=True)
             digest = _payload_digest(decision.canonical_payload)
             existing = state.decisions.get(decision.idempotency_ref)
             if existing is not None:
                 if existing.payload_digest != digest:
                     raise IdempotencyConflict("decision idempotency conflict")
                 return "duplicate"
+            fence.ensure_active()
             state.decisions[decision.idempotency_ref] = _StoredDecision(decision, digest)
             return "applied"
 
-    def provenance(self, scope: ScopeReferences, memory_ref: str) -> dict[str, Any]:
+    async def provenance(
+        self,
+        scope: ScopeReferences,
+        memory_ref: str,
+        fence: OperationFence,
+    ) -> dict[str, Any]:
         with self._lock:
-            state = self._state(scope)
+            fence.ensure_active()
+            state = self._state(scope, create=False)
             if memory_ref in state.tombstones:
                 return {"status": "complete_empty", "entries": [], "omissionCodes": ["revoked"]}
             stored = state.events_by_memory.get(memory_ref)
@@ -280,15 +351,19 @@ class InMemoryTenantPartitionedShadowStore:
                 "omissionCodes": omitted,
             }
 
-    def revoke(self, revocation: RevocationRecord) -> str:
+    async def revoke(self, revocation: RevocationRecord, fence: OperationFence) -> str:
+        if self._mutation_delay_seconds:
+            await asyncio.sleep(self._mutation_delay_seconds)
         with self._lock:
-            state = self._state(revocation.scope)
+            fence.ensure_active()
+            state = self._state(revocation.scope, create=True)
             digest = _payload_digest(revocation.canonical_payload)
             existing = state.revocation_idempotency.get(revocation.idempotency_ref)
             if existing is not None:
                 if existing != (revocation.revocation_ref, digest):
                     raise IdempotencyConflict("revocation idempotency conflict")
                 return "duplicate"
+            fence.ensure_active()
             stored = _StoredRevocation(revocation, digest)
             state.revocation_idempotency[revocation.idempotency_ref] = (
                 revocation.revocation_ref,
@@ -302,17 +377,25 @@ class InMemoryTenantPartitionedShadowStore:
                 neighbors.discard(revocation.memory_ref)
             return "applied"
 
-    def revocation_status(
-        self, scope: ScopeReferences, revocation_ref: str
+    async def revocation_status(
+        self,
+        scope: ScopeReferences,
+        revocation_ref: str,
+        fence: OperationFence,
     ) -> RevocationRecord | None:
         with self._lock:
-            stored = self._state(scope).revocations_by_ref.get(revocation_ref)
+            fence.ensure_active()
+            stored = self._state(scope, create=False).revocations_by_ref.get(
+                revocation_ref
+            )
             return stored.revocation if stored is not None else None
 
-    def _state(self, scope: ScopeReferences) -> _TenantState:
+    def _state(self, scope: ScopeReferences, *, create: bool) -> _TenantState:
         if not self._available:
             raise StoreUnavailable("shadow store unavailable")
-        return self._states.setdefault(scope.partition, _TenantState())
+        if create:
+            return self._states.setdefault(scope.partition, _TenantState())
+        return self._states.get(scope.partition, _TenantState())
 
     def _replace_edges(self, state: _TenantState, event: EventProjection) -> None:
         for neighbors in state.adjacency.values():

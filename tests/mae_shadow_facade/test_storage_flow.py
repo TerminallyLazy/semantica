@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import copy
+import time
 
+from semantica.mae_shadow_facade.app import FacadeSettings
 from semantica.mae_shadow_facade.storage import InMemoryTenantPartitionedShadowStore
 
 from .helpers import (
@@ -12,9 +14,9 @@ from .helpers import (
     ref,
     retrieval,
     revocation,
+    synthetic_app,
     token,
 )
-from .test_auth_schema import synthetic_app
 
 
 def post(app, path, body, permission, nonce):
@@ -187,3 +189,32 @@ def test_decision_and_provenance_routes_are_structural_and_scoped():
         "lineage",
     }
     assert all(set(entry) == {"kind", "referenceRef", "occurredAt", "lifecycle"} for entry in provenance["entries"])
+
+
+def test_expired_mutation_fence_cannot_commit_late():
+    auth = authorization()
+    store = InMemoryTenantPartitionedShadowStore(mutation_delay_seconds=0.05)
+    app = synthetic_app(
+        store,
+        settings=FacadeSettings(enabled=True, mutation_deadline_seconds=0.01),
+    )
+    status, response = post(
+        app,
+        "/v1/shadow/events:batch",
+        event_batch(auth),
+        "shadow.events:write",
+        "deadline-mutation",
+    )
+    assert status == 200
+    assert response["status"] == "unavailable"
+
+    time.sleep(0.06)
+    _, retrieved = post(
+        app,
+        "/v1/shadow/retrievals",
+        retrieval(auth),
+        "shadow.retrievals:read",
+        "deadline-read",
+    )
+    assert retrieved["status"] == "complete_empty"
+    assert retrieved["candidates"] == []

@@ -19,12 +19,14 @@ Enabling it in production requires explicit injection of:
 
 - an audience-bound, short-lived asymmetric/KMS JWT or mTLS workload verifier
   whose `production_ready` property is `True`; and
-- a production tenant-partitioned store.
+- a production tenant-partitioned store with transactional deadline fences; and
+- a distributed account-attempt limiter whose `production_ready` property is
+  `True`.
 
-There is no static API-key fallback. `SyntheticHMACWorkloadTokenVerifier` and
-`InMemoryTenantPartitionedShadowStore` are non-production reference components
-for synthetic tests only. The constructor refuses them in enabled mode unless
-the caller explicitly sets `allow_synthetic=True`.
+There is no static API-key fallback and no symmetric workload verifier in the
+runtime package. Synthetic signing and verification exist only under `tests/`.
+`InMemoryTenantPartitionedShadowStore` is a non-production reference component,
+and the constructor refuses it in enabled mode. There is no production bypass.
 
 The production verifier must validate issuer, audience, subject, permission,
 expiry of at most 60 seconds, unique token identity/replay, and the complete
@@ -50,6 +52,11 @@ static API-key headers fail closed. Retrieval is deterministic and bounded to
 10 anchors, 20 candidate mappings, three hops, and a 200-node synthetic graph
 visit budget. Events are limited to 50 and 256 KiB. Backend failures remain
 distinguishable from empty results through explicit `unavailable` responses.
+The ingress deadline begins before authentication, account quota charging, and
+body receipt; authenticated malformed requests consume account-level quota.
+Store operations are asynchronous and carry an immutable deadline fence that a
+production transaction must validate immediately before committing. No worker
+thread may continue a mutation after an `unavailable` response.
 
 ## Operational blockers before real data
 

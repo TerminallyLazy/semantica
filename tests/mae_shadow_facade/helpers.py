@@ -2,14 +2,144 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import binascii
 import hashlib
 import hmac
 import json
+import threading
 import time
 from typing import Any
 
+from semantica.mae_shadow_facade.app import FacadeSettings, MaeShadowASGI
+from semantica.mae_shadow_facade.auth import (
+    AuthenticationFailure,
+    WorkloadIdentity,
+)
+from semantica.mae_shadow_facade.contracts import (
+    ContractViolation,
+    parse_authorization,
+    validate_opaque_ref,
+)
+from semantica.mae_shadow_facade.logging import NullEventSink
+from semantica.mae_shadow_facade.service import MaeShadowService
+from semantica.mae_shadow_facade.storage import (
+    InMemoryTenantPartitionedShadowStore,
+    OperationFence,
+)
+
 
 SYNTHETIC_KEY = b"synthetic-mae-shadow-key-32-bytes-minimum"
+
+
+class TestHMACVerifier:
+    """Tests-only HS256 verifier; the production factory always rejects it."""
+
+    __test__ = False
+    production_ready = False
+
+    def __init__(self) -> None:
+        self._seen: set[str] = set()
+        self._lock = threading.Lock()
+
+    def verify(self, raw_token, *, required_permission, now=None):
+        try:
+            encoded_header, encoded_claims, encoded_signature = raw_token.split(".")
+            header = json.loads(_decode(encoded_header))
+            claims = json.loads(_decode(encoded_claims))
+        except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise AuthenticationFailure("malformed test token") from error
+        if header != {"alg": "HS256", "kid": "synthetic-v1", "typ": "JWT"}:
+            raise AuthenticationFailure("test token header")
+        signing_input = f"{encoded_header}.{encoded_claims}".encode()
+        expected = hmac.new(SYNTHETIC_KEY, signing_input, hashlib.sha256).digest()
+        if not hmac.compare_digest(expected, _decode(encoded_signature)):
+            raise AuthenticationFailure("test token signature")
+        if (
+            set(claims)
+            != {
+                "iss",
+                "aud",
+                "sub",
+                "iat",
+                "exp",
+                "jti",
+                "permission",
+                "authorization",
+            }
+            or claims["iss"] != "mae-gateway"
+            or claims["aud"] != "mae-semantica-shadow"
+            or claims["sub"] != "mae-gateway"
+            or claims["permission"] != required_permission
+        ):
+            raise AuthenticationFailure("test token binding")
+        current = int(time.time() if now is None else now)
+        if (
+            not isinstance(claims["iat"], int)
+            or not isinstance(claims["exp"], int)
+            or claims["exp"] <= claims["iat"]
+            or claims["exp"] - claims["iat"] > 60
+            or claims["exp"] <= current - 5
+        ):
+            raise AuthenticationFailure("test token expiry")
+        try:
+            jti = validate_opaque_ref(claims["jti"])
+            auth = parse_authorization(claims["authorization"])
+        except ContractViolation as error:
+            raise AuthenticationFailure("test authorization") from error
+        if (
+            int(auth.issued_at.timestamp()) != claims["iat"]
+            or int(auth.expires_at.timestamp()) != claims["exp"]
+        ):
+            raise AuthenticationFailure("test authorization time")
+        with self._lock:
+            if jti in self._seen:
+                raise AuthenticationFailure("test token replay")
+            self._seen.add(jti)
+        return WorkloadIdentity(auth, required_permission, jti)
+
+
+class TestAccountLimiter:
+    """Tests-only account limiter with observable attempt charging."""
+
+    __test__ = False
+    production_ready = False
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str, int]] = []
+        self.counts: dict[tuple[str, str], int] = {}
+
+    def ready(self) -> bool:
+        return True
+
+    async def consume(self, account_ref, bucket, limit, fence: OperationFence):
+        fence.ensure_active()
+        key = (account_ref, bucket)
+        self.calls.append((account_ref, bucket, limit))
+        count = self.counts.get(key, 0)
+        if count >= limit:
+            return False
+        self.counts[key] = count + 1
+        return True
+
+
+def synthetic_app(
+    store=None,
+    *,
+    limiter=None,
+    settings=None,
+    sink=None,
+):
+    """Build an enabled test app without exposing a production bypass."""
+
+    instance = object.__new__(MaeShadowASGI)
+    instance._settings = settings or FacadeSettings(enabled=True)
+    instance._verifier = TestHMACVerifier()
+    instance._service = MaeShadowService(
+        store or InMemoryTenantPartitionedShadowStore()
+    )
+    instance._event_sink = sink or NullEventSink()
+    instance._attempt_limiter = limiter or TestAccountLimiter()
+    return instance
 
 
 def ref(label: str) -> str:
@@ -163,10 +293,16 @@ def call_app(
     body: Any = None,
     bearer: str | None = None,
     extra_headers: list[tuple[bytes, bytes]] | None = None,
+    raw_body: bytes | None = None,
+    receive_delay_seconds: float = 0.0,
 ) -> tuple[int, dict[str, Any]]:
-    encoded = b"" if body is None else json.dumps(body, separators=(",", ":")).encode()
+    encoded = (
+        raw_body
+        if raw_body is not None
+        else b"" if body is None else json.dumps(body, separators=(",", ":")).encode()
+    )
     headers = list(extra_headers or [])
-    if body is not None:
+    if body is not None or raw_body is not None:
         headers.extend(
             [(b"content-type", b"application/json"), (b"content-length", str(len(encoded)).encode())]
         )
@@ -177,6 +313,8 @@ def call_app(
 
     async def receive() -> dict[str, Any]:
         nonlocal received
+        if receive_delay_seconds:
+            await asyncio.sleep(receive_delay_seconds)
         if received:
             return {"type": "http.disconnect"}
         received = True
@@ -200,6 +338,13 @@ def call_app(
 
 def _encode(value: bytes) -> str:
     return base64.urlsafe_b64encode(value).decode().rstrip("=")
+
+
+def _decode(value: str) -> bytes:
+    try:
+        return base64.urlsafe_b64decode(value + "=" * ((4 - len(value) % 4) % 4))
+    except (ValueError, binascii.Error) as error:
+        raise AuthenticationFailure("malformed test token") from error
 
 
 def _timestamp(seconds: int) -> str:

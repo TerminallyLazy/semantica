@@ -6,6 +6,9 @@
       "name": "mae-semantica-shadow-facade",
       "properties": [
         {"name": "mae:default-enabled", "value": "false"},
+        {"name": "mae:mutation-commit", "value": "async-deadline-fenced"},
+        {"name": "mae:production-auth", "value": "injected-asymmetric-kms-or-mtls"},
+        {"name": "mae:production-limiter", "value": "injected-distributed-account-attempts"},
         {"name": "mae:real-data-approved", "value": "false"},
         {"name": "mae:runtime-dependencies", "value": "python-standard-library-only"}
       ],

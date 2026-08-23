@@ -25,6 +25,20 @@ def main() -> int:
         errors.append("provenance base revision mismatch")
     if provenance.get("build", {}).get("runtimeDependencies") != []:
         errors.append("provenance must declare zero runtime dependencies")
+    if provenance.get("build", {}).get("mutationCommit") != (
+        "async-transactional-deadline-fence-required"
+    ):
+        errors.append("provenance mutation fence declaration mismatch")
+    sbom_properties = {
+        item.get("name"): item.get("value")
+        for item in sbom.get("metadata", {})
+        .get("component", {})
+        .get("properties", [])
+    }
+    if sbom_properties.get("mae:production-limiter") != (
+        "injected-distributed-account-attempts"
+    ):
+        errors.append("SBOM production limiter declaration mismatch")
     if "Third-party runtime dependencies: none" not in lock:
         errors.append("dependency lock is not the expected zero-dependency lock")
 

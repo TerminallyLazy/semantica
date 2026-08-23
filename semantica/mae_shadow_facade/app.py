@@ -2,19 +2,18 @@
 
 The module-level application is intentionally disabled. Production enablement
 must inject both a production-ready workload identity verifier and a production
-tenant-partitioned store. The synthetic HS256 verifier is accepted only when a
-test explicitly opts into ``allow_synthetic``.
+tenant-partitioned store. Symmetric test authentication is absent from this
+package and cannot be enabled through the production factory.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
-import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Protocol
 
 from .auth import (
     AuthenticationFailure,
@@ -37,6 +36,8 @@ from .service import MaeShadowService, authorization_wire
 from .storage import (
     IdempotencyConflict,
     InMemoryTenantPartitionedShadowStore,
+    OperationDeadlineExceeded,
+    OperationFence,
     StoreUnavailable,
     TenantPartitionedShadowStore,
 )
@@ -45,11 +46,11 @@ from .storage import (
 @dataclass(frozen=True)
 class FacadeSettings:
     enabled: bool = False
-    allow_synthetic: bool = False
     mutation_deadline_seconds: float = 2.0
     query_deadline_seconds: float = 0.2
     event_requests_per_minute: int = 60
     retrieval_requests_per_minute: int = 30
+    other_requests_per_minute: int = 60
 
 
 @dataclass(frozen=True)
@@ -82,32 +83,38 @@ _ROUTES = {
 }
 
 
-class PartitionRateLimiter:
-    """Small synthetic limiter; production needs a distributed equivalent."""
+class AccountAttemptLimiter(Protocol):
+    """Distributed-ready account attempt quota seam."""
 
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._windows: dict[tuple[tuple[str, str, str | None], str], tuple[int, int]] = {}
+    production_ready: bool
 
-    def consume(
+    def ready(self) -> bool: ...
+
+    async def consume(
         self,
-        partition: tuple[str, str, str | None],
-        operation: str,
+        account_ref: str,
+        bucket: str,
         limit: int,
-        *,
-        now: float | None = None,
+        fence: OperationFence,
+    ) -> bool: ...
+
+
+class RejectingAccountAttemptLimiter:
+    """Fail-closed default; never usable by an enabled deployment."""
+
+    production_ready = False
+
+    def ready(self) -> bool:
+        return False
+
+    async def consume(
+        self,
+        account_ref: str,
+        bucket: str,
+        limit: int,
+        fence: OperationFence,
     ) -> bool:
-        current = int(time.time() if now is None else now)
-        window = current // 60
-        key = (partition, operation)
-        with self._lock:
-            stored_window, count = self._windows.get(key, (window, 0))
-            if stored_window != window:
-                stored_window, count = window, 0
-            if count >= limit:
-                return False
-            self._windows[key] = (stored_window, count + 1)
-            return True
+        return False
 
 
 class MaeShadowASGI:
@@ -118,19 +125,21 @@ class MaeShadowASGI:
         verifier: WorkloadTokenVerifier,
         store: TenantPartitionedShadowStore,
         event_sink: SafeEventSink,
-        rate_limiter: PartitionRateLimiter | None = None,
+        attempt_limiter: AccountAttemptLimiter,
     ) -> None:
-        if settings.enabled and not verifier.production_ready and not settings.allow_synthetic:
+        if settings.enabled and not verifier.production_ready:
             raise ValueError(
                 "enabled facade requires an asymmetric/KMS or mTLS production verifier"
             )
-        if settings.enabled and isinstance(store, InMemoryTenantPartitionedShadowStore) and not settings.allow_synthetic:
+        if settings.enabled and not store.production_ready:
             raise ValueError("enabled facade requires a production tenant store")
+        if settings.enabled and not attempt_limiter.production_ready:
+            raise ValueError("enabled facade requires a distributed production limiter")
         self._settings = settings
         self._verifier = verifier
         self._service = MaeShadowService(store)
         self._event_sink = event_sink
-        self._rate_limiter = rate_limiter or PartitionRateLimiter()
+        self._attempt_limiter = attempt_limiter
 
     async def __call__(self, scope: Mapping[str, Any], receive: Any, send: Any) -> None:
         if scope.get("type") == "lifespan":
@@ -149,7 +158,11 @@ class MaeShadowASGI:
             return
         if method == "GET" and path == "/health/ready":
             try:
-                ready = self._settings.enabled and self._service.ready()
+                ready = (
+                    self._settings.enabled
+                    and self._service.ready()
+                    and self._attempt_limiter.ready()
+                )
             except Exception:
                 ready = False
             await self._send_json(send, 200 if ready else 503, {"status": "ready" if ready else "unavailable"})
@@ -167,6 +180,14 @@ class MaeShadowASGI:
         status = 500
         parsed: Any = None
         identity: WorkloadIdentity | None = None
+        invoking = False
+        ingress_started = time.monotonic()
+        deadline_seconds = (
+            self._settings.mutation_deadline_seconds
+            if route.mutation
+            else self._settings.query_deadline_seconds
+        )
+        deadline_at = ingress_started + deadline_seconds
         try:
             headers = self._headers(scope)
             if "x-api-key" in headers or "api-key" in headers:
@@ -178,36 +199,50 @@ class MaeShadowASGI:
             if prefix != "Bearer" or not separator or not token or " " in token:
                 raise AuthenticationFailure("bearer workload token required")
             identity = self._verifier.verify(token, required_permission=route.permission)
-
-            if path_ref is not None:
-                path_ref = validate_opaque_ref(path_ref)
-            if route.parser is not None:
-                body = await self._read_json(receive, route.maximum_body_bytes, headers)
-                parsed = route.parser(body)
-                if parsed.authorization != identity.authorization:
-                    raise AuthenticationFailure("token and body authorization mismatch")
+            fence = OperationFence(
+                request_ref=identity.jti,
+                deadline_monotonic=deadline_at,
+            )
+            fence.ensure_active()
 
             limit = self._limit_for(route)
-            if not self._rate_limiter.consume(
-                identity.authorization.scope.partition,
-                route.name,
-                limit,
-            ):
+            allowed = await asyncio.wait_for(
+                self._attempt_limiter.consume(
+                    identity.authorization.scope.account_ref,
+                    route.name,
+                    limit,
+                    fence,
+                ),
+                timeout=fence.remaining(),
+            )
+            if not allowed:
                 status = 429
                 await self._send_json(send, status, {"error": "rate_limited"})
                 return
 
-            deadline = (
-                self._settings.mutation_deadline_seconds
-                if route.mutation
-                else self._settings.query_deadline_seconds
-            )
+            if path_ref is not None:
+                path_ref = validate_opaque_ref(path_ref)
+            if route.parser is not None:
+                body = await self._read_json(
+                    receive, route.maximum_body_bytes, headers, fence
+                )
+                parsed = route.parser(body)
+                if parsed.authorization != identity.authorization:
+                    raise AuthenticationFailure("token and body authorization mismatch")
+            fence.ensure_active()
+            invoking = True
             try:
                 response = await asyncio.wait_for(
-                    asyncio.to_thread(self._invoke, route.name, parsed, identity, path_ref),
-                    timeout=deadline,
+                    self._invoke(
+                        route.name, parsed, identity, path_ref, fence
+                    ),
+                    timeout=fence.remaining(),
                 )
-            except (asyncio.TimeoutError, StoreUnavailable):
+            except (
+                asyncio.TimeoutError,
+                OperationDeadlineExceeded,
+                StoreUnavailable,
+            ):
                 response = self._unavailable(route.name, parsed, identity, path_ref)
             status = 200
             await self._send_json(send, status, response)
@@ -223,31 +258,47 @@ class MaeShadowASGI:
         except IdempotencyConflict:
             status = 409
             await self._send_json(send, status, {"error": "idempotency_conflict"})
+        except (asyncio.TimeoutError, OperationDeadlineExceeded):
+            if invoking and identity is not None:
+                status = 200
+                await self._send_json(
+                    send,
+                    status,
+                    self._unavailable(route.name, parsed, identity, path_ref),
+                )
+            else:
+                status = 408
+                await self._send_json(send, status, {"error": "request_timeout"})
         except Exception:
             status = 500
             await self._send_json(send, status, {"error": "internal_error"})
         finally:
             self._event_sink.emit("request_complete", route.name, status)
 
-    def _invoke(
+    async def _invoke(
         self,
         route: str,
         parsed: Any,
         identity: WorkloadIdentity,
         path_ref: str | None,
+        fence: OperationFence,
     ) -> dict[str, Any]:
         if route == "events_batch":
-            return self._service.apply_events(parsed)
+            return await self._service.apply_events(parsed, fence)
         if route == "retrievals":
-            return self._service.retrieve(parsed)
+            return await self._service.retrieve(parsed, fence)
         if route == "decisions":
-            return self._service.record_decision(parsed)
+            return await self._service.record_decision(parsed, fence)
         if route == "revocations":
-            return self._service.revoke(parsed)
+            return await self._service.revoke(parsed, fence)
         if route == "provenance":
-            return self._service.provenance(identity.authorization, path_ref or "")
+            return await self._service.provenance(
+                identity.authorization, path_ref or "", fence
+            )
         if route == "revocation_status":
-            return self._service.revocation_status(identity.authorization, path_ref or "")
+            return await self._service.revocation_status(
+                identity.authorization, path_ref or "", fence
+            )
         raise ContractViolation("unknown operation")
 
     def _unavailable(
@@ -321,6 +372,7 @@ class MaeShadowASGI:
         receive: Any,
         maximum: int,
         headers: Mapping[str, list[str]],
+        fence: OperationFence,
     ) -> Any:
         content_types = headers.get("content-type", [])
         if len(content_types) != 1 or content_types[0].split(";", 1)[0].strip().lower() != "application/json":
@@ -339,7 +391,8 @@ class MaeShadowASGI:
                 raise ContractViolation("invalid content length") from error
         chunks = bytearray()
         while True:
-            message = await receive()
+            message = await asyncio.wait_for(receive(), timeout=fence.remaining())
+            fence.ensure_active()
             if message.get("type") == "http.disconnect":
                 raise ContractViolation("request disconnected")
             if message.get("type") != "http.request":
@@ -349,12 +402,16 @@ class MaeShadowASGI:
                 raise BodyTooLarge
             if not message.get("more_body", False):
                 break
-        return json.loads(bytes(chunks), object_pairs_hook=_reject_duplicate_pairs)
+        result = json.loads(bytes(chunks), object_pairs_hook=_reject_duplicate_pairs)
+        fence.ensure_active()
+        return result
 
     def _limit_for(self, route: _Route) -> int:
         if route.name == "retrievals":
             return self._settings.retrieval_requests_per_minute
-        return self._settings.event_requests_per_minute
+        if route.name == "events_batch":
+            return self._settings.event_requests_per_minute
+        return self._settings.other_requests_per_minute
 
     @staticmethod
     async def _send_json(send: Any, status: int, value: Mapping[str, Any]) -> None:
@@ -418,12 +475,14 @@ def create_app(
     verifier: WorkloadTokenVerifier | None = None,
     store: TenantPartitionedShadowStore | None = None,
     event_sink: SafeEventSink | None = None,
+    attempt_limiter: AccountAttemptLimiter | None = None,
 ) -> MaeShadowASGI:
     return MaeShadowASGI(
         settings=settings or FacadeSettings(),
         verifier=verifier or RejectingWorkloadTokenVerifier(),
         store=store or InMemoryTenantPartitionedShadowStore(),
         event_sink=event_sink or MetadataOnlyEventSink(),
+        attempt_limiter=attempt_limiter or RejectingAccountAttemptLimiter(),
     )
 
 

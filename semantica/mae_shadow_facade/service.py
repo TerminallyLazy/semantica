@@ -13,7 +13,7 @@ from .contracts import (
     ScopeReferences,
     WireAuthorization,
 )
-from .storage import TenantPartitionedShadowStore
+from .storage import OperationFence, TenantPartitionedShadowStore
 
 
 class MaeShadowService:
@@ -25,8 +25,12 @@ class MaeShadowService:
     def ready(self) -> bool:
         return self._store.ready()
 
-    def apply_events(self, request: EventBatchRequest) -> dict[str, Any]:
-        results = self._store.apply_events(request.authorization.scope, request.events)
+    async def apply_events(
+        self, request: EventBatchRequest, fence: OperationFence
+    ) -> dict[str, Any]:
+        results = await self._store.apply_events(
+            request.authorization.scope, request.events, fence
+        )
         status = "complete"
         if any(
             result["disposition"] not in {"applied", "duplicate"}
@@ -40,8 +44,10 @@ class MaeShadowService:
             "results": results,
         }
 
-    def retrieve(self, request: RetrievalRequest) -> dict[str, Any]:
-        result = self._store.retrieve(request)
+    async def retrieve(
+        self, request: RetrievalRequest, fence: OperationFence
+    ) -> dict[str, Any]:
+        result = await self._store.retrieve(request, fence)
         return {
             "schemaVersion": 1,
             "requestRef": request.request_ref,
@@ -49,8 +55,10 @@ class MaeShadowService:
             **result,
         }
 
-    def record_decision(self, decision: DecisionRecord) -> dict[str, Any]:
-        disposition = self._store.record_decision(decision)
+    async def record_decision(
+        self, decision: DecisionRecord, fence: OperationFence
+    ) -> dict[str, Any]:
+        disposition = await self._store.record_decision(decision, fence)
         return {
             "schemaVersion": 1,
             "decisionRef": decision.decision_ref,
@@ -59,12 +67,15 @@ class MaeShadowService:
             "disposition": disposition,
         }
 
-    def provenance(
+    async def provenance(
         self,
         authorization: WireAuthorization,
         memory_ref: str,
+        fence: OperationFence,
     ) -> dict[str, Any]:
-        result = self._store.provenance(authorization.scope, memory_ref)
+        result = await self._store.provenance(
+            authorization.scope, memory_ref, fence
+        )
         return {
             "schemaVersion": 1,
             "memoryRef": memory_ref,
@@ -72,8 +83,10 @@ class MaeShadowService:
             **result,
         }
 
-    def revoke(self, request: RevocationRequest) -> dict[str, Any]:
-        self._store.revoke(request.revocation)
+    async def revoke(
+        self, request: RevocationRequest, fence: OperationFence
+    ) -> dict[str, Any]:
+        await self._store.revoke(request.revocation, fence)
         return {
             "schemaVersion": 1,
             "authorization": authorization_wire(request.authorization),
@@ -82,18 +95,21 @@ class MaeShadowService:
             "pending": False,
         }
 
-    def revocation_status(
+    async def revocation_status(
         self,
         authorization: WireAuthorization,
         revocation_ref: str,
+        fence: OperationFence,
     ) -> dict[str, Any]:
-        record = self._store.revocation_status(authorization.scope, revocation_ref)
+        record = await self._store.revocation_status(
+            authorization.scope, revocation_ref, fence
+        )
         return {
             "schemaVersion": 1,
             "authorization": authorization_wire(authorization),
             "revocationRef": revocation_ref,
-            "status": "complete" if record is not None else "complete_empty",
-            "pending": False,
+            "status": "complete" if record is not None else "unavailable",
+            "pending": record is None,
         }
 
 

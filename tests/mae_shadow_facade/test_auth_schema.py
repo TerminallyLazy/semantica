@@ -2,42 +2,61 @@ from __future__ import annotations
 
 import copy
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
 from semantica.mae_shadow_facade.app import FacadeSettings, create_app
-from semantica.mae_shadow_facade.auth import SyntheticHMACWorkloadTokenVerifier
+from semantica.mae_shadow_facade.auth import AuthenticationFailure
 from semantica.mae_shadow_facade.logging import NullEventSink
 from semantica.mae_shadow_facade.storage import InMemoryTenantPartitionedShadowStore
 
-from .helpers import SYNTHETIC_KEY, authorization, call_app, event_batch, token
+from .helpers import (
+    TestAccountLimiter,
+    TestHMACVerifier,
+    authorization,
+    call_app,
+    event_batch,
+    synthetic_app,
+    token,
+)
 
 
-def synthetic_app(store=None):
-    verifier = SyntheticHMACWorkloadTokenVerifier(
-        issuer="mae-gateway",
-        audience="mae-semantica-shadow",
-        keys={"synthetic-v1": SYNTHETIC_KEY},
-    )
-    return create_app(
-        settings=FacadeSettings(enabled=True, allow_synthetic=True),
-        verifier=verifier,
-        store=store or InMemoryTenantPartitionedShadowStore(),
-        event_sink=NullEventSink(),
-    )
+class ProductionVerifierStub:
+    production_ready = True
+
+    def verify(self, token, *, required_permission, now=None):
+        raise AuthenticationFailure("stub")
 
 
-def test_facade_defaults_disabled_and_requires_production_identity():
+class ProductionStoreStub(InMemoryTenantPartitionedShadowStore):
+    production_ready = True
+
+
+def test_facade_defaults_disabled():
     status, payload = call_app(create_app(event_sink=NullEventSink()), "GET", "/health/ready")
     assert (status, payload) == (503, {"status": "unavailable"})
 
-    verifier = SyntheticHMACWorkloadTokenVerifier(
-        issuer="mae-gateway",
-        audience="mae-semantica-shadow",
-        keys={"synthetic-v1": SYNTHETIC_KEY},
-    )
+
+def test_production_factory_cannot_enable_tests_only_hs256():
     with pytest.raises(ValueError, match="production verifier"):
-        create_app(settings=FacadeSettings(enabled=True), verifier=verifier)
+        create_app(settings=FacadeSettings(enabled=True), verifier=TestHMACVerifier())
+
+    runtime_python = "\n".join(
+        path.read_text()
+        for path in Path("semantica/mae_shadow_facade").glob("*.py")
+    )
+    assert "HS256" not in runtime_python
+
+
+def test_production_factory_requires_distributed_limiter():
+    with pytest.raises(ValueError, match="production limiter"):
+        create_app(
+            settings=FacadeSettings(enabled=True),
+            verifier=ProductionVerifierStub(),
+            store=ProductionStoreStub(),
+            attempt_limiter=TestAccountLimiter(),
+        )
 
 
 def test_valid_short_lived_audience_bound_token_and_exact_scope():
@@ -144,3 +163,44 @@ def test_event_count_limit_is_rejected():
         bearer=token(auth, "shadow.events:write", nonce="event-limit"),
     )
     assert (status, response) == (422, {"error": "invalid_contract"})
+
+
+def test_slow_and_malformed_bodies_charge_account_attempt_quota():
+    limiter = TestAccountLimiter()
+    settings = FacadeSettings(
+        enabled=True,
+        mutation_deadline_seconds=0.01,
+        event_requests_per_minute=2,
+    )
+    app = synthetic_app(limiter=limiter, settings=settings)
+    auth_a = authorization(family="family-a", member="member-a")
+    slow_status, _ = call_app(
+        app,
+        "POST",
+        "/v1/shadow/events:batch",
+        body=event_batch(auth_a),
+        bearer=token(auth_a, "shadow.events:write", nonce="slow-body"),
+        receive_delay_seconds=0.03,
+    )
+    assert slow_status == 408
+
+    malformed_status, _ = call_app(
+        app,
+        "POST",
+        "/v1/shadow/events:batch",
+        raw_body=b"{",
+        bearer=token(auth_a, "shadow.events:write", nonce="malformed-body"),
+    )
+    assert malformed_status == 422
+
+    auth_b = authorization(family="family-b", member="member-b")
+    denied_status, _ = call_app(
+        app,
+        "POST",
+        "/v1/shadow/events:batch",
+        body=event_batch(auth_b),
+        bearer=token(auth_b, "shadow.events:write", nonce="account-quota"),
+    )
+    assert denied_status == 429
+    assert {call[0] for call in limiter.calls} == {auth_a["scope"]["accountRef"]}
+    assert {call[1:] for call in limiter.calls} == {("events_batch", 2)}
