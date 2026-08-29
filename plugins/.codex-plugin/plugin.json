@@ -25,7 +25,8 @@
     "extraction",
     "mcp"
   ],
-  "skills": "./skills",
+  "skills": "./skills/",
+  "hooks": "./hooks/hooks.json",
   "interface": {
     "capabilities": [
       "Read",
