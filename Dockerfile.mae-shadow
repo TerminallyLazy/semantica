@@ -1,0 +1,15 @@
+FROM python:3.12.11-slim@sha256:47ae396f09c1303b8653019811a8498470603d7ffefc29cb07c88f1f8cb3d19f
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PORT=8080
+
+WORKDIR /app
+COPY requirements-mae-shadow.lock ./
+RUN pip install -r requirements-mae-shadow.lock
+COPY semantica/__init__.py ./semantica/__init__.py
+COPY semantica/mae_shadow_facade ./semantica/mae_shadow_facade
+RUN useradd --system --uid 10001 semantica
+USER 10001
+CMD ["sh", "-c", "exec uvicorn semantica.mae_shadow_facade.production_app:app --host 0.0.0.0 --port ${PORT} --workers 2 --no-access-log"]

@@ -1,8 +1,10 @@
 # Start with a tiny Docker context and opt in only files used by Dockerfile.
 *
 !Dockerfile
+!Dockerfile.mae-shadow
 !.dockerignore
 !pyproject.toml
+!requirements-mae-shadow.lock
 !README.md
 !LICENSE
 !MANIFEST.in
