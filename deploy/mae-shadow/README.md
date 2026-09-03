@@ -22,8 +22,10 @@ fields before storage.
 - Vercel Workload Identity Federation restricted to the exact Mae production
   project/environment subject.
 
-Apply `001_schema.sql` and then `002_operations.sql` before starting the
-service. Readiness remains unavailable unless schema version 2 is present.
+Apply `001_schema.sql`, `002_operations.sql`, and `003_runtime_role.sql` in
+order before starting the service. Readiness remains unavailable unless schema
+version 3 is present. Grant the `mae_shadow_runtime` role to the dedicated
+Cloud SQL login; never run the service as `postgres` or a database owner.
 
 ## Runtime settings
 

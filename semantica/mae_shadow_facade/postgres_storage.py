@@ -59,7 +59,7 @@ class PostgresTenantPartitionedShadowStore:
                 row = connection.execute(
                     "SELECT version FROM mae_shadow.schema_version WHERE singleton = true"
                 ).fetchone()
-                return row is not None and row[0] == 2
+                return row is not None and row[0] == 3
         except Exception:
             return False
 
